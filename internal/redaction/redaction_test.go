@@ -143,6 +143,28 @@ func TestRedact(t *testing.T) {
 			mustContain:      []string{`x [REDACTED:r1]\nnext`},
 		},
 		{
+			// The greedy group can swallow more than one escape: a token followed
+			// by a CRLF or a blank line reports both escapes. Trimming only the
+			// last one leaves the secret ending on the other, and the rewriter then
+			// deletes that line break instead.
+			name:             "two escapes captured from the leaf are trimmed together",
+			doc:              `{"a":"x JWT\n\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\n\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\n\nnext`},
+		},
+		{
+			name:             "a CRLF captured from the leaf keeps its carriage return",
+			doc:              `{"a":"x JWT\r\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\r\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\r\nnext`},
+		},
+		{
 			name:     "protected path is left alone and recorded",
 			doc:      `{"keepme":"SEC","other":"plain"}`,
 			findings: []Finding{{RuleID: "r1", Secret: "SEC"}},
@@ -398,6 +420,24 @@ func TestPendingSecretsTrimsEscapeBackslashes(t *testing.T) {
 		{
 			name:     "a trailing tab escape is trimmed whole",
 			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\t`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			// The greedy group can report several escapes at once; trimming has
+			// to keep going until the secret ends on an ordinary character, or
+			// the rewriter deletes the line break the remaining escape encodes.
+			name:     "consecutive escapes are all trimmed",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n\n`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a CRLF is trimmed whole, carriage return included",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\r\n`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "an escape left behind by trailing backslashes is trimmed too",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n\\`}},
 			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
 		},
 		{

@@ -343,18 +343,28 @@ func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder 
 // The scanner reports `\n` as part of the secret as well, because it re-applies
 // the rule to the matched text and the greedy group then consumes the escape up
 // to the end of that text. Left alone, that replacement silently deletes the
-// line break.
+// line break. Removing only the last escape is not enough: a token followed by a
+// CRLF or a blank line still ends on an escape once the first one is gone, and
+// the rewriter would delete that one instead, so the trimming repeats until the
+// secret ends on an ordinary character.
 //
 // A credential does not end with an escape sequence, so dropping the trailing
-// escape is safe and keeps the leaf decodable.
+// escapes is safe and keeps the leaf decodable.
 func trimTrailingEscapes(secret string) string {
-	if n := len(secret); n >= 2 && secret[n-2] == '\\' {
+	// Each iteration removes at least one character, so this terminates.
+	for {
+		secret = strings.TrimRight(secret, `\`)
+		n := len(secret)
+		if n < 2 || secret[n-2] != '\\' {
+			return secret
+		}
 		switch secret[n-1] {
 		case 'n', 'r', 't':
 			secret = secret[:n-2]
+		default:
+			return secret
 		}
 	}
-	return strings.TrimRight(secret, `\`)
 }
 
 // rewriter walks a decoded JSON value tree replacing secrets in eligible string

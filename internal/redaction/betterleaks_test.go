@@ -383,6 +383,59 @@ func TestRedactJWTBeforeNewlineEscape(t *testing.T) {
 	assert.False(t, again.Changed())
 }
 
+// TestRedactJWTPreservesFollowingLineBreaks covers the escapes the greedy group
+// can report together with the token: a blank line and a CRLF. Trimming only the
+// innermost escape would leave the token ending on the other one, and the
+// rewriter would delete that line break — the same class of context loss the
+// escaped-quote case is about.
+func TestRedactJWTPreservesFollowingLineBreaks(t *testing.T) {
+	testCases := []struct {
+		name string
+		leaf string
+		want string
+	}{
+		{
+			name: "blank line after the token",
+			leaf: "Bearer " + fakeJWT + "\n\nHost: uploads.linear.app",
+			want: "Bearer [REDACTED:jwt]\n\nHost: uploads.linear.app",
+		},
+		{
+			name: "CRLF after the token",
+			leaf: "Bearer " + fakeJWT + "\r\nHost: uploads.linear.app",
+			want: "Bearer [REDACTED:jwt]\r\nHost: uploads.linear.app",
+		},
+	}
+
+	scanner, err := DefaultScanner()
+	require.NoError(t, err)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := json.Marshal(map[string]any{"content": tc.leaf})
+			require.NoError(t, err)
+
+			r := New(scanner)
+			redacted, report, err := r.Redact(context.Background(), doc)
+			require.NoError(t, err)
+			require.True(t, report.Changed())
+			assert.Contains(t, report.RuleIDs(), "jwt")
+			assert.NotContains(t, string(redacted), fakeJWT)
+
+			var got struct {
+				Content string `json:"content"`
+			}
+			require.NoError(t, json.Unmarshal(redacted, &got))
+			assert.Equal(t, tc.want, got.Content)
+
+			// The result is stable: redacting it again changes nothing.
+			twice, again, err := r.Redact(context.Background(), redacted)
+			require.NoError(t, err)
+			assert.Equal(t, string(redacted), string(twice))
+			assert.False(t, again.Changed())
+		})
+	}
+}
+
 func BenchmarkDefaultScannerInit(b *testing.B) {
 	for b.Loop() {
 		if _, err := newBetterleaksScanner(); err != nil {
