@@ -826,6 +826,9 @@ func materializeSessionFixture(t *testing.T, src string) string {
 		"__AWS_SECRET_ACCESS_KEY__": "kQ7zXn2VbW9pLm4RtY6" + "uHs3JdF8gA1cE5oPzQwXn",
 		"__GITHUB_PAT__":            "ghp_erOZlZv0B1e3amrQ" + "ugdwZ8Ro2W4kDql9WPTf",
 		"__ANTHROPIC_API_KEY__":     "sk-ant-api03-sT5wsx9DwmaHZDL0dUWKNhAhULxa35sUzyLFK9" + "5QBTZMDJTYn8p0J7ZQbwpYGYCQeW5eXAAGtVSmhp7UO9vxHJtSBC0xpAA",
+		"__SESSION_JWT__": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+			"eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ." +
+			"SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
 		"__GIT_REPOSITORY_WITH_CREDENTIALS__": "https://oauth2:" +
 			"ghp_erOZlZv0B1e3amrQ" + "ugdwZ8Ro2W4kDql9WPTf" + "@github.com/example/repo.git",
 	}
