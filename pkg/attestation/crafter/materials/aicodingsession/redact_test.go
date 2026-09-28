@@ -50,6 +50,11 @@ const (
 	fixtureAnthropicKey = "sk-ant-api03-sT5wsx9DwmaHZDL0dUWKNhAhULxa35sUzyLFK9" +
 		"5QBTZMDJTYn8p0J7ZQbwpYGYCQeW5eXAAGtVSmhp7UO9vxHJtSBC0xpAA"
 	fixtureRepository = "https://oauth2:" + fixtureGitHubPAT + "@github.com/example/repo.git"
+	// A JWT in a presigned URL, the shape that used to lose the whole leaf: the
+	// URL is a JSON string, so the token sits between `=` and an escaped quote.
+	fixtureJWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+		"eyJzdWIiOiJmYWtlLXVwbG9hZCIsImV4cCI6MTc5MDAwMDAwMH0." +
+		"c2lnbmF0dXJlLWZha2UtZm9yLXJlcHJv"
 )
 
 // fixtureSecrets maps each placeholder in the session fixtures to the value the
@@ -61,6 +66,7 @@ var fixtureSecrets = map[string]string{
 	"__GITHUB_PAT__":                      fixtureGitHubPAT,
 	"__ANTHROPIC_API_KEY__":               fixtureAnthropicKey,
 	"__GIT_REPOSITORY_WITH_CREDENTIALS__": fixtureRepository,
+	"__SESSION_JWT__":                     fixtureJWT,
 }
 
 // readFixture loads a session fixture with its credential placeholders resolved.
@@ -140,12 +146,13 @@ func TestRedact(t *testing.T) {
 		wantUnchanged  bool
 		wantRules      []string
 		wantByRule     map[string]int
+		mustContain    []string
 		mustNotContain []string
 	}{
 		{
 			name:      "secrets across transcript threads, warnings and the repository URL",
 			file:      "testdata/session-with-secrets.json",
-			wantRules: []string{"anthropic-api-key", "aws-access-token", "aws-secret-access-key", "github-pat"},
+			wantRules: []string{"anthropic-api-key", "aws-access-token", "aws-secret-access-key", "github-pat", "jwt"},
 			// The AWS key id appears in both raw_session threads and in a subagent
 			// description, and is only detectable at all because its secret access
 			// key sits next to one of them; the PAT is in the repository URL and in
@@ -157,8 +164,12 @@ func TestRedact(t *testing.T) {
 				"aws-access-token":      3,
 				"aws-secret-access-key": 1,
 				"github-pat":            2,
+				"jwt":                   1,
 			},
-			mustNotContain: []string{fixtureAWSKey, fixtureAWSSecret, fixtureGitHubPAT, fixtureAnthropicKey},
+			// The JWT is followed by an escaped quote, so the token is the only
+			// thing that may disappear: the presigned URL around it has to survive.
+			mustContain:    []string{`?signature=[REDACTED:jwt]\" had expired`},
+			mustNotContain: []string{fixtureAWSKey, fixtureAWSSecret, fixtureGitHubPAT, fixtureAnthropicKey, fixtureJWT},
 		},
 		{
 			name:          "false-positive shaped content is left alone",
@@ -197,6 +208,9 @@ func TestRedact(t *testing.T) {
 			assert.Empty(t, report.Unlocated)
 			for _, s := range tc.mustNotContain {
 				assert.NotContains(t, string(got), s)
+			}
+			for _, s := range tc.mustContain {
+				assert.Contains(t, string(got), s)
 			}
 
 			// The redacted document must still be a valid AI coding session.

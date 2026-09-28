@@ -287,17 +287,24 @@ func (r *Redactor) Redact(ctx context.Context, doc []byte) ([]byte, *Report, err
 type secretRule struct {
 	secret string
 	ruleID string
+	// keep is the tail of secret that trimTrailingEscapes removed: escape
+	// characters that are not part of the credential and are written back
+	// after the placeholder so the escape stays whole.
+	keep string
 }
 
 // pendingSecrets deduplicates findings and drops the ones the loop has decided
-// not to chase. The result is ordered longest-secret-first so that a secret
-// contained within a longer one cannot partially clobber it.
+// not to chase. The secret is searched for as reported; the escape characters a
+// greedy rule captured after it (see trimTrailingEscapes) are kept and written
+// back after the placeholder. The result is ordered longest-secret-first so that
+// a secret contained within a longer one cannot partially clobber it.
 func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder func(string) bool) []secretRule {
 	seen := make(map[string]struct{}, len(findings))
 	out := make([]secretRule, 0, len(findings))
 
 	for _, f := range findings {
-		if f.Secret == "" {
+		trimmed := trimTrailingEscapes(f.Secret)
+		if trimmed == "" {
 			continue
 		}
 		if _, skipped := skip[f.Secret]; skipped {
@@ -305,15 +312,17 @@ func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder 
 		}
 		// A finding whose whole secret is a placeholder is a rule matching the
 		// position it sits in, not a credential. Rewriting it would churn the
-		// document on every run and never terminate.
-		if isPlaceholder != nil && isPlaceholder(f.Secret) {
+		// document on every run and never terminate. It is checked without the
+		// trailing escapes: a placeholder followed by an escape would otherwise
+		// be rewritten to itself on every pass.
+		if isPlaceholder != nil && isPlaceholder(trimmed) {
 			continue
 		}
 		if _, dup := seen[f.Secret]; dup {
 			continue
 		}
 		seen[f.Secret] = struct{}{}
-		out = append(out, secretRule{secret: f.Secret, ruleID: f.RuleID})
+		out = append(out, secretRule{secret: f.Secret, ruleID: f.RuleID, keep: f.Secret[len(trimmed):]})
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -323,6 +332,44 @@ func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder 
 		return out[i].secret < out[j].secret
 	})
 	return out
+}
+
+// trimTrailingEscapes drops what a greedy rule captured from the escape sequence
+// that follows a secret in a JSON-encoded leaf. A rule whose character class
+// allows `\` (jwt does) takes the backslash of a following `\"`, and the
+// scanner can report a following `\n`, `\r` or `\t` too; replacing either cuts
+// the escape, and the leaf then fails to decode. Backslashes are counted, so a
+// `\\` pair, which encodes a literal backslash in the secret, is kept.
+func trimTrailingEscapes(secret string) string {
+	for {
+		n := len(secret)
+		run := trailingBackslashes(secret)
+		if run%2 == 1 {
+			// The dangling first half of an escape.
+			secret = secret[:n-1]
+			continue
+		}
+		if run > 0 || n < 2 {
+			return secret
+		}
+		switch secret[n-1] {
+		case 'n', 'r', 't':
+			if trailingBackslashes(secret[:n-1])%2 == 1 {
+				secret = secret[:n-2]
+				continue
+			}
+		}
+		return secret
+	}
+}
+
+// trailingBackslashes counts the backslashes at the end of s.
+func trailingBackslashes(s string) int {
+	n := 0
+	for n < len(s) && s[len(s)-1-n] == '\\' {
+		n++
+	}
+	return n
 }
 
 // rewriter walks a decoded JSON value tree replacing secrets in eligible string
@@ -383,7 +430,7 @@ func (w *rewriter) redactLeaf(s string) string {
 		if c == 0 {
 			continue
 		}
-		body = strings.ReplaceAll(body, sr.secret, w.placeholder(sr.ruleID))
+		body = strings.ReplaceAll(body, sr.secret, w.placeholder(sr.ruleID)+sr.keep)
 		n += c
 		w.byRule[sr.ruleID] += c
 		w.located[sr.secret] = struct{}{}

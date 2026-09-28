@@ -150,6 +150,11 @@ const (
 	githubPAT     = "ghp_erOZlZv0B1e3amrQ" + "ugdwZ8Ro2W4kDql9WPTf"
 	anthropicKey  = "sk-ant-api03-sT5wsx9DwmaHZDL0dUWKNhAhULxa35sUzyLFK9" + "5QBTZMDJTYn8p0J7ZQbwpYGYCQeW5eXAAGtVSmhp7UO9vxHJtSBC0xpAA"
 	repositoryURL = "https://oauth2:" + githubPAT + "@github.com/example/repo.git"
+	// A JWT from a presigned URL: inside a JSON string leaf, so it sits between
+	// `=` and an escaped quote.
+	sessionJWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+		"eyJzdWIiOiJmYWtlLXVwbG9hZCIsImV4cCI6MTc5MDAwMDAwMH0." +
+		"c2lnbmF0dXJlLWZha2UtZm9yLXJlcHJv"
 )
 
 // Keep in sync with fixtureSecrets in the aicodingsession package.
@@ -159,6 +164,7 @@ var fixtureSecrets = map[string]string{
 	"__GITHUB_PAT__":                      githubPAT,
 	"__ANTHROPIC_API_KEY__":               anthropicKey,
 	"__GIT_REPOSITORY_WITH_CREDENTIALS__": repositoryURL,
+	"__SESSION_JWT__":                     sessionJWT,
 }
 
 // materializeFixture writes a copy of a session fixture with its credential
@@ -203,8 +209,8 @@ func TestChainloopAICodingSessionCrafterRedaction(t *testing.T) {
 			name:         "secrets are stripped before upload",
 			filePath:     withSecrets,
 			wantRedacted: true,
-			wantCount:    "7",
-			wantRules:    "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat",
+			wantCount:    "8",
+			wantRules:    "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat,jwt",
 		},
 		{
 			// An inline backend embeds the content into the attestation itself,
@@ -213,8 +219,8 @@ func TestChainloopAICodingSessionCrafterRedaction(t *testing.T) {
 			filePath:      withSecrets,
 			inlineBackend: true,
 			wantRedacted:  true,
-			wantCount:     "7",
-			wantRules:     "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat",
+			wantCount:     "8",
+			wantRules:     "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat,jwt",
 		},
 		{
 			// Neither uploaded nor stored inline, so the sanitized copy exists
@@ -223,8 +229,8 @@ func TestChainloopAICodingSessionCrafterRedaction(t *testing.T) {
 			filePath:     withSecrets,
 			skipUpload:   true,
 			wantRedacted: true,
-			wantCount:    "7",
-			wantRules:    "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat",
+			wantCount:    "8",
+			wantRules:    "anthropic-api-key,aws-access-token,aws-secret-access-key,github-pat,jwt",
 		},
 		{
 			name:          "the opt-out is recorded in the attestation",
@@ -295,6 +301,11 @@ func TestChainloopAICodingSessionCrafterRedaction(t *testing.T) {
 				assert.Equal(t, sha256Digest(string(content)), got.GetArtifact().Digest)
 				assert.NotContains(t, string(content), awsKey)
 				assert.Contains(t, string(content), "[REDACTED:aws-access-token]")
+				// The JWT shared a leaf with the presigned URL around it, so the
+				// whole leaf must not be the thing that got redacted.
+				assert.NotContains(t, string(content), sessionJWT)
+				assert.Contains(t, string(content),
+					"uploads.linear.app/o/3f1a/9c2b/design-spec.zip?signature=[REDACTED:jwt]")
 
 				if stored != nil {
 					assert.Equal(t, string(stored), string(content))

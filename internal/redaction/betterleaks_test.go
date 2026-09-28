@@ -17,6 +17,7 @@ package redaction
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -42,6 +43,13 @@ const (
 )
 
 var fakeAnthropicKey = "sk-ant-api03-" + strings.Repeat("a", 93) + "AA"
+
+// fakeJWT is a syntactically valid but entirely fabricated JWT: every segment is
+// a placeholder. It is assembled from fragments so the literal never appears in
+// a source file, for the same reason as the AWS pair below.
+var fakeJWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+	"eyJzdWIiOiJmYWtlLXVwbG9hZCIsImV4cCI6MTc5MDAwMDAwMH0." +
+	"c2lnbmF0dXJlLWZha2UtZm9yLXJlcHJv"
 
 // awsPair is the shape an AWS leak has to take to be detected at all: the
 // aws-access-token rule is composite and requires a secret access key nearby.
@@ -274,6 +282,150 @@ func TestRedactCredentialInURIConverges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(once), string(twice))
 	assert.False(t, report.Changed())
+}
+
+// TestRedactJWTBeforeEscapedQuote is the regression test for #3481: a JWT in a
+// nested JSON string leaf, followed by `\"` in the encoding, must be replaced on
+// its own. It used to take the escape's backslash with it, so the leaf stopped
+// decoding and was replaced whole, losing the URL host around the token.
+func TestRedactJWTBeforeEscapedQuote(t *testing.T) {
+	scanner, err := DefaultScanner()
+	require.NoError(t, err)
+
+	// The shape an MCP tool returns: a JSON document carried inside a text
+	// block of a session event, with a presigned URL in it.
+	const host = "https://uploads.linear.app/o/a/b"
+	inner := `{"url":"` + host + `?signature=` + fakeJWT + `"}`
+	doc, err := json.Marshal(map[string]any{
+		"data": map[string]any{
+			"result": []any{map[string]any{"type": "text", "text": inner}},
+		},
+	})
+	require.NoError(t, err)
+
+	r := New(scanner)
+	redacted, report, err := r.Redact(context.Background(), doc)
+	require.NoError(t, err)
+	require.True(t, report.Changed())
+	assert.Contains(t, report.RuleIDs(), "jwt")
+
+	assert.NotContains(t, string(redacted), fakeJWT, "the JWT must not survive")
+	assert.Contains(t, string(redacted), "[REDACTED:jwt]")
+	// The context around the secret must survive; replacing the whole leaf is
+	// exactly what this issue is about.
+	assert.Contains(t, string(redacted), host+"?signature=[REDACTED:jwt]")
+	assert.True(t, json.Valid(redacted), "the redacted document must stay valid JSON")
+
+	// The nested leaf has to remain a decodable JSON document with the host in
+	// it, otherwise a policy cannot tell a signed URL from a leaked credential.
+	var outer struct {
+		Data struct {
+			Result []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(redacted, &outer))
+	require.Len(t, outer.Data.Result, 1)
+	assert.Equal(t, "text", outer.Data.Result[0].Type)
+
+	var nested struct {
+		URL string `json:"url"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(outer.Data.Result[0].Text), &nested))
+	assert.Equal(t, host+"?signature=[REDACTED:jwt]", nested.URL)
+
+	// The result is stable: redacting it again changes nothing.
+	twice, again, err := r.Redact(context.Background(), redacted)
+	require.NoError(t, err)
+	assert.Equal(t, string(redacted), string(twice))
+	assert.False(t, again.Changed())
+}
+
+// TestRedactKeepsEscapesAroundSecrets covers the escapes that can follow a
+// secret in a string leaf. Only the secret may go: a line break the scanner
+// reported with a JWT survives, and a literal backslash-n that belongs to a
+// password is redacted with it.
+func TestRedactKeepsEscapesAroundSecrets(t *testing.T) {
+	testCases := []struct {
+		name   string
+		leaf   string
+		rule   string
+		secret string
+		want   string
+	}{
+		{
+			name:   "newline after a JWT",
+			leaf:   "Authorization: Bearer " + fakeJWT + "\nHost: uploads.linear.app",
+			rule:   "jwt",
+			secret: fakeJWT,
+			want:   "Authorization: Bearer [REDACTED:jwt]\nHost: uploads.linear.app",
+		},
+		{
+			name:   "blank line after a JWT",
+			leaf:   "Bearer " + fakeJWT + "\n\nHost: uploads.linear.app",
+			rule:   "jwt",
+			secret: fakeJWT,
+			want:   "Bearer [REDACTED:jwt]\n\nHost: uploads.linear.app",
+		},
+		{
+			name:   "CRLF after a JWT",
+			leaf:   "Bearer " + fakeJWT + "\r\nHost: uploads.linear.app",
+			rule:   "jwt",
+			secret: fakeJWT,
+			want:   "Bearer [REDACTED:jwt]\r\nHost: uploads.linear.app",
+		},
+		{
+			// `\n` here is a backslash and an n, the last two characters of
+			// the password, not a line break.
+			name:   "literal backslash-n ending a password",
+			leaf:   `DB_PASSWORD=Zq8mLp2Vx9rT\n next`,
+			rule:   "generic-password",
+			secret: "Zq8mLp2Vx9rT",
+			want:   "DB_PASSWORD=[REDACTED:generic-password] next",
+		},
+		{
+			// The reported secret is `s` plus two CRLF escapes. It is searched
+			// for as reported, so the short `s` alone never matches the rest of
+			// the leaf.
+			name: "short password before CRLFs",
+			leaf: "password: s\r\n\r\nHost: services.example.com",
+			rule: "generic-password",
+			want: "password: [REDACTED:generic-password]\r\n\r\nHost: services.example.com",
+		},
+	}
+
+	scanner, err := DefaultScanner()
+	require.NoError(t, err)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := json.Marshal(map[string]any{"content": tc.leaf})
+			require.NoError(t, err)
+
+			r := New(scanner)
+			redacted, report, err := r.Redact(context.Background(), doc)
+			require.NoError(t, err)
+			require.True(t, report.Changed())
+			assert.Contains(t, report.RuleIDs(), tc.rule)
+			if tc.secret != "" {
+				assert.NotContains(t, string(redacted), tc.secret)
+			}
+
+			var got struct {
+				Content string `json:"content"`
+			}
+			require.NoError(t, json.Unmarshal(redacted, &got))
+			assert.Equal(t, tc.want, got.Content)
+
+			// The result is stable: redacting it again changes nothing.
+			twice, again, err := r.Redact(context.Background(), redacted)
+			require.NoError(t, err)
+			assert.Equal(t, string(redacted), string(twice))
+			assert.False(t, again.Changed())
+		})
+	}
 }
 
 func BenchmarkDefaultScannerInit(b *testing.B) {

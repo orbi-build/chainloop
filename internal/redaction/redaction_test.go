@@ -117,6 +117,75 @@ func TestRedact(t *testing.T) {
 			mustContain:      []string{"[REDACTED:r1]"},
 		},
 		{
+			// A rule whose character class allows `\` can take the backslash of
+			// the escape that follows the secret; replacing it cuts the escape.
+			name:             "trailing backslash captured from an escape sequence is trimmed",
+			doc:              `{"a":"x JWT\"y"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\"y`},
+		},
+		{
+			// The same escape capture, with the whole `\n` sequence reported as
+			// part of the secret: replacing it would delete the line break.
+			name:             "trailing escape sequence captured from the leaf is trimmed",
+			doc:              `{"a":"x JWT\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\nnext`},
+		},
+		{
+			name:             "two escapes captured from the leaf are trimmed together",
+			doc:              `{"a":"x JWT\n\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\n\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\n\nnext`},
+		},
+		{
+			// `\\n` encodes a literal backslash followed by n, part of the
+			// secret; it is not an escape and must be redacted with the rest.
+			name:             "a literal backslash-n at the end of a secret is redacted",
+			doc:              `{"a":"DB_PASSWORD=Zq8\\n next"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `Zq8\\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"Zq8", `\\n`},
+			mustContain:      []string{`DB_PASSWORD=[REDACTED:r1] next`},
+		},
+		{
+			// The secret is searched for as reported: the short credential
+			// on its own would also match the unrelated text after it.
+			name:             "a short secret before escapes does not match unrelated text",
+			doc:              `{"a":"DB_PASSWORD=Qx7\n\nnext Qx7 aQx7b"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `Qx7\n\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustContain:      []string{`DB_PASSWORD=[REDACTED:r1]\n\nnext Qx7 aQx7b`},
+		},
+		{
+			// Once redacted, a placeholder followed by escapes can be reported
+			// again; it is recognised as a placeholder and left alone.
+			name:          "a placeholder reported with trailing escapes is left alone",
+			doc:           `{"a":"x [REDACTED:r1]\n\nnext"}`,
+			findings:      []Finding{{RuleID: "r1", Secret: `[REDACTED:r1]\n\n`}},
+			wantUnchanged: true,
+		},
+		{
+			name:             "a CRLF captured from the leaf keeps its carriage return",
+			doc:              `{"a":"x JWT\r\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\r\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\r\nnext`},
+		},
+		{
 			name:     "protected path is left alone and recorded",
 			doc:      `{"keepme":"SEC","other":"plain"}`,
 			findings: []Finding{{RuleID: "r1", Secret: "SEC"}},
@@ -300,4 +369,128 @@ func TestReportRuleIDs(t *testing.T) {
 	r := &Report{ByRule: map[string]int{"b": 2, "a": 1}, Unlocated: map[string]int{"c": 1}}
 	assert.Equal(t, []string{"a", "b"}, r.RuleIDs())
 	assert.Nil(t, (*Report)(nil).RuleIDs())
+}
+
+// TestPendingSecretsKeepsTrailingEscapes pins how a secret is split from the
+// escape characters a greedy rule captured after it: the secret is searched for
+// as reported, and keep holds what is written back after the placeholder.
+func TestPendingSecretsKeepsTrailingEscapes(t *testing.T) {
+	testCases := []struct {
+		name     string
+		findings []Finding
+		want     []secretRule
+	}{
+		{
+			name:     "secret without an escape is unchanged",
+			findings: []Finding{{RuleID: "jwt", Secret: "eyJ.sig"}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a single character secret is unchanged",
+			findings: []Finding{{RuleID: "r1", Secret: "a"}},
+			want:     []secretRule{{secret: "a", ruleID: "r1"}},
+		},
+		{
+			name:     "a single backslash is dropped",
+			findings: []Finding{{RuleID: "r1", Secret: `\`}},
+			want:     []secretRule{},
+		},
+		{
+			name:     "a backslash that opens no escape is kept",
+			findings: []Finding{{RuleID: "r1", Secret: `a\b`}},
+			want:     []secretRule{{secret: `a\b`, ruleID: "r1"}},
+		},
+		{
+			name:     "a dangling trailing backslash is split off",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\`}},
+			want:     []secretRule{{secret: `eyJ.sig\`, ruleID: "jwt", keep: `\`}},
+		},
+		{
+			// An even run of backslashes encodes literal backslashes.
+			name:     "a trailing backslash pair is a literal backslash and is kept",
+			findings: []Finding{{RuleID: "r1", Secret: `pw\\`}},
+			want:     []secretRule{{secret: `pw\\`, ruleID: "r1"}},
+		},
+		{
+			name:     "a literal backslash-n is kept",
+			findings: []Finding{{RuleID: "r1", Secret: `Zq8\\n`}},
+			want:     []secretRule{{secret: `Zq8\\n`, ruleID: "r1"}},
+		},
+		{
+			name:     "an escape after a literal backslash is split off, the literal kept",
+			findings: []Finding{{RuleID: "r1", Secret: `Zq8\\\n`}},
+			want:     []secretRule{{secret: `Zq8\\\n`, ruleID: "r1", keep: `\n`}},
+		},
+		{
+			name:     "a trailing newline escape is split off whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n`}},
+			want:     []secretRule{{secret: `eyJ.sig\n`, ruleID: "jwt", keep: `\n`}},
+		},
+		{
+			name:     "a trailing carriage return escape is split off whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\r`}},
+			want:     []secretRule{{secret: `eyJ.sig\r`, ruleID: "jwt", keep: `\r`}},
+		},
+		{
+			name:     "a trailing tab escape is split off whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\t`}},
+			want:     []secretRule{{secret: `eyJ.sig\t`, ruleID: "jwt", keep: `\t`}},
+		},
+		{
+			// The greedy group can report several escapes at once; trimming has
+			// to keep going until the secret ends on an ordinary character, or
+			// the rewriter deletes the line break the remaining escape encodes.
+			name:     "consecutive escapes are all split off",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n\n`}},
+			want:     []secretRule{{secret: `eyJ.sig\n\n`, ruleID: "jwt", keep: `\n\n`}},
+		},
+		{
+			name:     "a CRLF is split off whole, carriage return included",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\r\n`}},
+			want:     []secretRule{{secret: `eyJ.sig\r\n`, ruleID: "jwt", keep: `\r\n`}},
+		},
+		{
+			name:     "an escape before a dangling backslash is split off too",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n\`}},
+			want:     []secretRule{{secret: `eyJ.sig\n\`, ruleID: "jwt", keep: `\n\`}},
+		},
+		{
+			// A `\\` inside the secret is not an escape, and the trailing
+			// escape-letter is not a backslash: neither may be split off.
+			name:     "a backslash elsewhere in the secret is kept",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ\sig`}},
+			want:     []secretRule{{secret: `eyJ\sig`, ruleID: "jwt"}},
+		},
+		{
+			name:     "an escape-letter without a backslash is kept",
+			findings: []Finding{{RuleID: "jwt", Secret: "eyJ.sign"}},
+			want:     []secretRule{{secret: "eyJ.sign", ruleID: "jwt"}},
+		},
+		{
+			// Trimming must not leave an empty needle behind: it matches everywhere.
+			name:     "a finding that is only an escape is dropped",
+			findings: []Finding{{RuleID: "jwt", Secret: `\n`}},
+			want:     []secretRule{},
+		},
+		{
+			// Deduplication works on the secret as reported: the escape that
+			// follows it is part of the text the rewriter has to find.
+			name: "a finding with a dangling backslash is kept apart, longest first",
+			findings: []Finding{
+				{RuleID: "jwt", Secret: "eyJ.sig"},
+				{RuleID: "jwt", Secret: `eyJ.sig\`},
+			},
+			want: []secretRule{
+				{secret: `eyJ.sig\`, ruleID: "jwt", keep: `\`},
+				{secret: "eyJ.sig", ruleID: "jwt"},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pendingSecrets(tc.findings, nil, IsDefaultPlaceholder)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }
