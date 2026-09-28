@@ -117,6 +117,32 @@ func TestRedact(t *testing.T) {
 			mustContain:      []string{"[REDACTED:r1]"},
 		},
 		{
+			// A rule whose character class allows `\` can capture the backslash
+			// of the escape sequence that follows the secret inside a JSON string
+			// leaf (the jwt rule does, before a `\"`). Replacing that trailing
+			// backslash cuts the escape in half, the leaf stops decoding, and the
+			// fail-closed guard throws away the surrounding context — which is the
+			// bug. The secret must be normalised before it is searched for.
+			name:             "trailing backslash captured from an escape sequence is trimmed",
+			doc:              `{"a":"x JWT\"y"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\"y`},
+		},
+		{
+			// The same escape capture, with the whole `\n` sequence reported as
+			// part of the secret: replacing it would delete the line break.
+			name:             "trailing escape sequence captured from the leaf is trimmed",
+			doc:              `{"a":"x JWT\nnext"}`,
+			findings:         []Finding{{RuleID: "r1", Secret: `JWT\n`}},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r1": 1},
+			mustNotContain:   []string{"JWT"},
+			mustContain:      []string{`x [REDACTED:r1]\nnext`},
+		},
+		{
 			name:     "protected path is left alone and recorded",
 			doc:      `{"keepme":"SEC","other":"plain"}`,
 			findings: []Finding{{RuleID: "r1", Secret: "SEC"}},
@@ -133,6 +159,24 @@ func TestRedact(t *testing.T) {
 			reportAlways:  true,
 			wantUnchanged: true,
 			wantUnlocated: map[string]int{"r1": 1},
+		},
+		{
+			// A finding the engine cannot attribute to a leaf is recorded and
+			// then left out of the following passes, so the loop still converges
+			// around the findings it can rewrite.
+			name: "an unlocatable finding is not chased on later passes",
+			doc:  `{"keep":"SEC","other":"OTHER"}`,
+			findings: []Finding{
+				{RuleID: "r1", Secret: "SEC"},
+				{RuleID: "r2", Secret: "OTHER"},
+			},
+			opts: []Option{WithPathFilter(func(p string) bool {
+				return p != "/keep"
+			})},
+			wantReplacements: 1,
+			wantByRule:       map[string]int{"r2": 1},
+			wantUnlocated:    map[string]int{"r1": 1},
+			mustContain:      []string{`"SEC"`, "[REDACTED:r2]"},
 		},
 		{
 			name:     "placeholder that keeps matching does not converge",
@@ -300,4 +344,100 @@ func TestReportRuleIDs(t *testing.T) {
 	r := &Report{ByRule: map[string]int{"b": 2, "a": 1}, Unlocated: map[string]int{"c": 1}}
 	assert.Equal(t, []string{"a", "b"}, r.RuleIDs())
 	assert.Nil(t, (*Report)(nil).RuleIDs())
+}
+
+// TestPendingSecretsTrimsEscapeBackslashes pins the normalisation that keeps a
+// greedy rule from swallowing the escape sequence following a secret inside an
+// encoded JSON leaf.
+func TestPendingSecretsTrimsEscapeBackslashes(t *testing.T) {
+	testCases := []struct {
+		name     string
+		findings []Finding
+		want     []secretRule
+	}{
+		{
+			name:     "secret without an escape is unchanged",
+			findings: []Finding{{RuleID: "jwt", Secret: "eyJ.sig"}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a single character secret is unchanged",
+			findings: []Finding{{RuleID: "r1", Secret: "a"}},
+			want:     []secretRule{{secret: "a", ruleID: "r1"}},
+		},
+		{
+			name:     "a single backslash is dropped",
+			findings: []Finding{{RuleID: "r1", Secret: `\`}},
+			want:     []secretRule{},
+		},
+		{
+			name:     "a backslash that opens no escape is kept",
+			findings: []Finding{{RuleID: "r1", Secret: `a\b`}},
+			want:     []secretRule{{secret: `a\b`, ruleID: "r1"}},
+		},
+		{
+			name:     "single trailing backslash is trimmed",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "repeated trailing backslashes are trimmed",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\\`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a trailing newline escape is trimmed whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\n`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a trailing carriage return escape is trimmed whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\r`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			name:     "a trailing tab escape is trimmed whole",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ.sig\t`}},
+			want:     []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+		{
+			// A `\\` inside the secret is not an escape, and the trailing
+			// escape-letter is not a backslash: neither may be trimmed.
+			name:     "a backslash elsewhere in the secret is kept",
+			findings: []Finding{{RuleID: "jwt", Secret: `eyJ\sig`}},
+			want:     []secretRule{{secret: `eyJ\sig`, ruleID: "jwt"}},
+		},
+		{
+			name:     "an escape-letter without a backslash is kept",
+			findings: []Finding{{RuleID: "jwt", Secret: "eyJ.sign"}},
+			want:     []secretRule{{secret: "eyJ.sign", ruleID: "jwt"}},
+		},
+		{
+			// Trimming must not leave an empty secret behind for the rewriter to
+			// search for: an empty needle matches everywhere.
+			name:     "a finding that is only backslashes is dropped",
+			findings: []Finding{{RuleID: "jwt", Secret: `\\`}},
+			want:     []secretRule{},
+		},
+		{
+			name:     "a finding that is only an escape is dropped",
+			findings: []Finding{{RuleID: "jwt", Secret: `\n`}},
+			want:     []secretRule{},
+		},
+		{
+			name: "findings that only differ by trailing backslashes are deduplicated",
+			findings: []Finding{
+				{RuleID: "jwt", Secret: `eyJ.sig\\`},
+				{RuleID: "jwt", Secret: "eyJ.sig"},
+			},
+			want: []secretRule{{secret: "eyJ.sig", ruleID: "jwt"}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pendingSecrets(tc.findings, nil, IsDefaultPlaceholder)
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

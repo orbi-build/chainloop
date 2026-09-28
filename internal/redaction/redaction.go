@@ -290,30 +290,33 @@ type secretRule struct {
 }
 
 // pendingSecrets deduplicates findings and drops the ones the loop has decided
-// not to chase. The result is ordered longest-secret-first so that a secret
-// contained within a longer one cannot partially clobber it.
+// not to chase. Secret text is normalised first (see trimTrailingEscapes), so
+// that deduplication, the skip list and the rewriter all work on the same
+// string. The result is ordered longest-secret-first so that a secret contained
+// within a longer one cannot partially clobber it.
 func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder func(string) bool) []secretRule {
 	seen := make(map[string]struct{}, len(findings))
 	out := make([]secretRule, 0, len(findings))
 
 	for _, f := range findings {
-		if f.Secret == "" {
+		secret := trimTrailingEscapes(f.Secret)
+		if secret == "" {
 			continue
 		}
-		if _, skipped := skip[f.Secret]; skipped {
+		if _, skipped := skip[secret]; skipped {
 			continue
 		}
 		// A finding whose whole secret is a placeholder is a rule matching the
 		// position it sits in, not a credential. Rewriting it would churn the
 		// document on every run and never terminate.
-		if isPlaceholder != nil && isPlaceholder(f.Secret) {
+		if isPlaceholder != nil && isPlaceholder(secret) {
 			continue
 		}
-		if _, dup := seen[f.Secret]; dup {
+		if _, dup := seen[secret]; dup {
 			continue
 		}
-		seen[f.Secret] = struct{}{}
-		out = append(out, secretRule{secret: f.Secret, ruleID: f.RuleID})
+		seen[secret] = struct{}{}
+		out = append(out, secretRule{secret: secret, ruleID: f.RuleID})
 	}
 
 	sort.Slice(out, func(i, j int) bool {
@@ -323,6 +326,35 @@ func pendingSecrets(findings []Finding, skip map[string]struct{}, isPlaceholder 
 		return out[i].secret < out[j].secret
 	})
 	return out
+}
+
+// trimTrailingEscapes removes the characters of an escape sequence that a
+// greedy rule can capture from the text following a secret inside a JSON string
+// leaf.
+//
+// The scanner sees the leaf's JSON encoding, where a quote or a newline is two
+// characters: `\"`, `\n`. A rule whose character class permits `\` — the jwt
+// rule's second and third segments do — greedily takes the backslash of that
+// escape. The rewriter then searches the encoded leaf for a secret that ends
+// inside the escape: replacing it cuts the sequence in half, the leaf stops
+// decoding, and the fail-closed guard throws away the whole leaf along with the
+// context around the secret.
+//
+// The scanner reports `\n` as part of the secret as well, because it re-applies
+// the rule to the matched text and the greedy group then consumes the escape up
+// to the end of that text. Left alone, that replacement silently deletes the
+// line break.
+//
+// A credential does not end with an escape sequence, so dropping the trailing
+// escape is safe and keeps the leaf decodable.
+func trimTrailingEscapes(secret string) string {
+	if n := len(secret); n >= 2 && secret[n-2] == '\\' {
+		switch secret[n-1] {
+		case 'n', 'r', 't':
+			secret = secret[:n-2]
+		}
+	}
+	return strings.TrimRight(secret, `\`)
 }
 
 // rewriter walks a decoded JSON value tree replacing secrets in eligible string

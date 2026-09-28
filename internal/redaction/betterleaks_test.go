@@ -17,6 +17,7 @@ package redaction
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -42,6 +43,13 @@ const (
 )
 
 var fakeAnthropicKey = "sk-ant-api03-" + strings.Repeat("a", 93) + "AA"
+
+// fakeJWT is a syntactically valid but entirely fabricated JWT: every segment is
+// a placeholder. It is assembled from fragments so the literal never appears in
+// a source file, for the same reason as the AWS pair below.
+var fakeJWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." +
+	"eyJzdWIiOiJmYWtlLXVwbG9hZCIsImV4cCI6MTc5MDAwMDAwMH0." +
+	"c2lnbmF0dXJlLWZha2UtZm9yLXJlcHJv"
 
 // awsPair is the shape an AWS leak has to take to be detected at all: the
 // aws-access-token rule is composite and requires a secret access key nearby.
@@ -274,6 +282,105 @@ func TestRedactCredentialInURIConverges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, string(once), string(twice))
 	assert.False(t, report.Changed())
+}
+
+// TestRedactJWTBeforeEscapedQuote is the regression test for chainloop issue
+// #3481. A JWT inside a nested JSON string leaf is followed by `\"` in the
+// document's encoding. The jwt rule's greedy signature segment allows a
+// backslash, so it captured the escape's backslash as part of the secret;
+// replacing it left an unescaped quote, the leaf stopped decoding, and the
+// fail-closed guard replaced the whole leaf with `[REDACTED:jwt]`. Every MCP
+// tool result became `[REDACTED:jwt]` and the URL host that
+// `ai-config-no-secrets` keys on was lost, which is what produced the false
+// positives.
+func TestRedactJWTBeforeEscapedQuote(t *testing.T) {
+	scanner, err := DefaultScanner()
+	require.NoError(t, err)
+
+	// The shape an MCP tool returns: a JSON document carried inside a text
+	// block of a session event, with a presigned URL in it.
+	const host = "https://uploads.linear.app/o/a/b"
+	inner := `{"url":"` + host + `?signature=` + fakeJWT + `"}`
+	doc, err := json.Marshal(map[string]any{
+		"data": map[string]any{
+			"result": []any{map[string]any{"type": "text", "text": inner}},
+		},
+	})
+	require.NoError(t, err)
+
+	r := New(scanner)
+	redacted, report, err := r.Redact(context.Background(), doc)
+	require.NoError(t, err)
+	require.True(t, report.Changed())
+	assert.Contains(t, report.RuleIDs(), "jwt")
+
+	assert.NotContains(t, string(redacted), fakeJWT, "the JWT must not survive")
+	assert.Contains(t, string(redacted), "[REDACTED:jwt]")
+	// The context around the secret must survive; replacing the whole leaf is
+	// exactly what this issue is about.
+	assert.Contains(t, string(redacted), host+"?signature=[REDACTED:jwt]")
+	assert.True(t, json.Valid(redacted), "the redacted document must stay valid JSON")
+
+	// The nested leaf has to remain a decodable JSON document with the host in
+	// it, otherwise a policy cannot tell a signed URL from a leaked credential.
+	var outer struct {
+		Data struct {
+			Result []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(redacted, &outer))
+	require.Len(t, outer.Data.Result, 1)
+	assert.Equal(t, "text", outer.Data.Result[0].Type)
+
+	var nested struct {
+		URL string `json:"url"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(outer.Data.Result[0].Text), &nested))
+	assert.Equal(t, host+"?signature=[REDACTED:jwt]", nested.URL)
+
+	// The result is stable: redacting it again changes nothing.
+	twice, again, err := r.Redact(context.Background(), redacted)
+	require.NoError(t, err)
+	assert.Equal(t, string(redacted), string(twice))
+	assert.False(t, again.Changed())
+}
+
+// TestRedactJWTBeforeNewlineEscape is the `\n` counterpart of the test above:
+// a multi-line string leaf where the escape right after the JWT is a newline.
+// The scanner reports the JWT together with the `\n` escape, so a naive
+// replacement deletes the line break and turns the request headers into one
+// line.
+func TestRedactJWTBeforeNewlineEscape(t *testing.T) {
+	scanner, err := DefaultScanner()
+	require.NoError(t, err)
+
+	// An HTTP header block as it appears in a session transcript.
+	leaf := "Authorization: Bearer " + fakeJWT + "\nHost: uploads.linear.app"
+	doc, err := json.Marshal(map[string]any{"content": leaf})
+	require.NoError(t, err)
+
+	r := New(scanner)
+	redacted, report, err := r.Redact(context.Background(), doc)
+	require.NoError(t, err)
+	require.True(t, report.Changed())
+	assert.Contains(t, report.RuleIDs(), "jwt")
+
+	assert.NotContains(t, string(redacted), fakeJWT)
+
+	var got struct {
+		Content string `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(redacted, &got))
+	// Only the JWT is gone: the line break and the second header survive.
+	assert.Equal(t, "Authorization: Bearer [REDACTED:jwt]\nHost: uploads.linear.app", got.Content)
+
+	twice, again, err := r.Redact(context.Background(), redacted)
+	require.NoError(t, err)
+	assert.Equal(t, string(redacted), string(twice))
+	assert.False(t, again.Changed())
 }
 
 func BenchmarkDefaultScannerInit(b *testing.B) {
